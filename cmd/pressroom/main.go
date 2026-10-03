@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -32,44 +33,31 @@ func main() {
 		Queue:       cfg.QueueSize,
 		Logger:      logger,
 	})
-	defer renderer.Close()
 
-	srv := &http.Server{
-		Addr: ":" + cfg.Port,
-		Handler: api.New(api.Deps{
-			Renderer:      renderer,
-			Token:         cfg.Token,
-			MaxBodyBytes:  cfg.MaxBodyBytes,
-			RenderTimeout: cfg.RenderTimeout,
-			Logger:        logger,
-		}),
-		MaxHeaderBytes:    16 << 10,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      cfg.RenderTimeout + 10*time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
+	srv := newServer(":"+cfg.Port, api.New(api.Deps{
+		Renderer:      renderer,
+		Token:         cfg.Token,
+		MaxBodyBytes:  cfg.MaxBodyBytes,
+		RenderTimeout: cfg.RenderTimeout,
+		Logger:        logger,
+	}), cfg.RenderTimeout)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	drained := make(chan struct{})
-	go func() {
-		defer close(drained)
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.RenderTimeout+5*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			logger.Error("shutdown", "err", err.Error())
-		}
-	}()
 
-	logger.Info("listening", "port", cfg.Port)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Error("server stopped", "err", err.Error())
-		renderer.Close()
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		logger.Error("listen failed", "err", err.Error())
 		os.Exit(1)
 	}
-	// ListenAndServe returns as soon as shutdown starts; wait until in-flight
-	// renders have finished before the browser is closed.
-	<-drained
+
+	logger.Info("listening", "port", cfg.Port)
+	// The browser is closed only after in-flight renders have drained: the
+	// drain may last as long as one render plus a margin.
+	err = serve(ctx, srv, ln, cfg.RenderTimeout+5*time.Second)
+	renderer.Close()
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Error("server stopped", "err", err.Error())
+		os.Exit(1)
+	}
 }

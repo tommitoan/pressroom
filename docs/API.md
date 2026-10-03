@@ -73,17 +73,25 @@ JSON body `{ "error": "<message safe to show a developer>", "code": "<code>" }`.
 - **Fonts must come from the image**, not from the web. The image provides Noto Serif (Latin and Vietnamese), Noto Serif CJK SC (Han characters) and Noto Sans as a fallback. A document should use the stack `"Noto Serif", "Noto Serif CJK SC", serif`.
 - Each render uses a new page in a shared browser, and nothing is stored.
 
-## Limits (starting values, tuned in Phase B4)
+## Limits
 
-| Limit | Value |
-|---|---|
-| request body | 2 MiB |
-| render time | 20 seconds |
-| concurrent renders | 2 |
-| queue behind them | 4 |
-| header and footer | 16 KiB each |
+Every value below is the default, is set from the environment where noted, and has a test that fails if the behaviour changes.
 
-Beyond the queue the service answers 429 quickly instead of waiting.
+| Limit | Value | Answer when exceeded | Tested by |
+|---|---|---|---|
+| request body | 2 MiB (`MAX_BODY_BYTES`) | `413 payload_too_large` | `TestPDFValidation`, `TestE2EBadRequestsAreRefusedAndHarmless` |
+| header and footer templates | 16 KiB each | `400 invalid_options` | `TestHeaderAndFooterSizeLimit` |
+| request headers | 16 KiB (net/http tolerates 4 KiB more) | `431` | `TestOversizedHeadersAreRefused` |
+| render time | 20 seconds (`RENDER_TIMEOUT`) | `504 render_timeout`, the tab is closed and the browser stays healthy | `TestRenderGetsADeadline`, `TestE2ERenderTimeoutOverHTTP`, `TestE2ERequestTimeoutReturnsDeadlineExceeded` |
+| concurrent renders | 2 (`RENDER_CONCURRENCY`) | the next ones wait in the queue | `TestNeverExceedsConcurrency` |
+| queue behind them | 4 (`RENDER_QUEUE`) | `429 busy` with `Retry-After`, answered within milliseconds | `TestFullLimiterRejectsAtOnce`, `TestE2EBurstAboveTheQueueIsTurnedAwayFast` |
+| reading headers, reading the body, idle connections | 5 s, 10 s, 60 s | the connection is closed | set in `newServer`; `TestWriteTimeoutOutlastsTheRenderDeadline` checks they are set |
+| writing the answer | render time plus 10 s | a render that ends at its deadline can still answer | `TestWriteTimeoutOutlastsTheRenderDeadline` |
+| shutdown | requests in flight finish, up to render time plus 5 s | new connections are refused at once | `TestServeDrainsRequestsInFlight`, `TestServeGivesUpWhenTheDrainTimeIsUp` |
+
+Beyond the queue the service answers 429 quickly instead of waiting. A burst of ten requests against one running and one queued render was answered with 2 renders and 8 rejections, the slowest rejection in 81 ms, and the service stayed ready.
+
+After a browser crash the next request starts a new browser. The service leaves no defunct processes, no temporary browser profiles and no open tabs behind (`TestE2ENoZombiesOrProfilesLeftAfterCrashRestartAndClose`, `TestE2ERendersDoNotLeakTabs`). The browser tests need `PRESSROOM_E2E=1`.
 
 ## Security model
 

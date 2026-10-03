@@ -199,7 +199,7 @@ make test                # tests only, no browser needed
 make e2e                 # also drives a real browser; needs CHROME_PATH
 ```
 
-The default tests use a fake renderer, so they need no browser. `make e2e` runs the same suite with `PRESSROOM_E2E=1` against the real engine: three-page Han and Vietnamese sample, page-number footers, a hostile page, request timeout, full queue, concurrent renders, a killed browser, and shutdown. The unit tests cover configuration (including that the token is never echoed), authentication, strict JSON handling, every option range, error mapping with `Retry-After`, the render deadline, panic recovery, and that logs never contain request content.
+The default tests use a fake renderer, so they need no browser. `make e2e` runs the same suite with `PRESSROOM_E2E=1` against the real engine, directly and through the HTTP handler: three-page Han and Vietnamese sample, page-number footers, margins, a hostile page, request timeout, a burst above the queue, concurrent renders, bad and oversized requests, a killed browser, and no leftover processes, profiles or tabs. Graceful shutdown is tested with a slow handler. Every documented limit is mapped to its test in [docs/API.md](docs/API.md#limits). The unit tests cover configuration (including that the token is never echoed), authentication, strict JSON handling, every option range, error mapping with `Retry-After`, the render deadline, panic recovery, and that logs never contain request content.
 
 ```
 cmd/pressroom        entry point (wiring only)

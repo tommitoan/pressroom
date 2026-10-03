@@ -8,7 +8,7 @@ test:
 
 # Drives a real browser; set CHROME_PATH (and CHROMIUM_NO_SANDBOX=true where needed).
 e2e:
-	PRESSROOM_E2E=1 go test -race -count=1 ./internal/render
+	PRESSROOM_E2E=1 go test -race -count=1 ./internal/render ./internal/api
 
 docker-build:
 	docker build -t pressroom:local .
