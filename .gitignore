@@ -1,0 +1,9 @@
+bin/
+dist/
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.log
+*.pdf
