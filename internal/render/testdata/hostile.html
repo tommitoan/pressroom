@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="http://css.pressroom-test.invalid/style.css">
+<style>
+  body { background: url("http://bg.pressroom-test.invalid/bg.png"); }
+  @font-face { font-family: Remote; src: url("http://font.pressroom-test.invalid/font.woff2"); }
+  p { font-family: Remote, serif; }
+</style>
+<script>document.title = "script ran"; fetch("http://fetch.pressroom-test.invalid/beacon");</script>
+</head>
+<body onload="fetch('http://onload.pressroom-test.invalid/beacon')">
+<p>Hostile page</p>
+<img src="http://pixel.pressroom-test.invalid/pixel.png" alt="">
+<iframe src="http://frame.pressroom-test.invalid/frame.html"></iframe>
+<iframe src="file:///etc/hosts"></iframe>
+<embed src="file:///etc/hosts">
+<img alt="inline" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==">
+</body>
+</html>

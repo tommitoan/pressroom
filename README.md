@@ -15,7 +15,7 @@ curl -sS -X POST http://localhost:8080/v1/pdf \
   -o hello.pdf
 ```
 
-> **Status: early development.** The HTTP API, authentication, validation and limits are done and tested. The Chromium rendering engine and the Docker image are the next milestones (see the [roadmap](#roadmap)); until then `POST /v1/pdf` answers `503 unavailable` and `GET /ready` answers `503`, on purpose, so the service never pretends to render.
+> **Status: early development.** The HTTP API, authentication, validation, limits and the Chromium rendering engine are done and tested end to end. The Docker image (fonts, non-root user) is the next milestone (see the [roadmap](#roadmap)). Without a Chrome or Chromium binary on the host, `POST /v1/pdf` answers `503 unavailable` and `GET /ready` answers `503`, on purpose, so the service never pretends to render.
 
 ## Why
 
@@ -36,8 +36,8 @@ It started as the export service for a personal web app, and was kept generic on
 | Done | Fixed error contract (`{"error", "code"}`), `Retry-After` on overload, errors never echo the request |
 | Done | `GET /health` and `GET /ready`, graceful shutdown, panic recovery, per-render deadline |
 | Done | Renderer behind an interface, with an honest "unavailable" implementation and a test double |
-| Next | Chromium engine: scripts disabled, every request intercepted and failed, one isolated page per render |
-| Next | Concurrency limit with a bounded queue (fast `429` instead of waiting) |
+| Done | Chromium engine: scripts disabled, every request intercepted and failed, one tab per render, browser started on first use and restarted if it dies |
+| Done | Concurrency limit with a bounded queue (fast `429` instead of waiting), graceful drain of in-flight renders on shutdown |
 | Next | Docker image with Han and Vietnamese-capable fonts, non-root |
 
 ## How it works
@@ -50,7 +50,7 @@ It started as the export service for a personal web app, and was kept generic on
 +--------------------------- pressroom ----------------------------+
 |  request log -> recover -> bearer auth -> validate -> Renderer   |
 |                                                         |        |
-|                                       (next) Chromium engine     |
+|                                          Chromium engine         |
 |                                       scripts off, network off   |
 +------------------------------------------------------------------+
     |  200 application/pdf
@@ -137,11 +137,13 @@ pressroom renders HTML written by someone else, so the page is treated as untrus
 - **Nothing stored, nothing logged.** Logs hold method, path, status, duration and sizes; never bodies, queries or tokens. Tests assert this.
 - **Errors say nothing about the input.** Messages are fixed text.
 - **Bounded input.** Strict JSON, unknown fields rejected, body size limit, option ranges, a deadline per render.
+- **No scripts, no network.** JavaScript is disabled and every request the page makes (stylesheets, images, fonts, frames) is intercepted and failed before it leaves the browser. The service never loads a URL. `data:` URIs work, so logos and small graphics can be inlined. An integration test renders a hostile page and asserts which requests were intercepted (see [docs/DESIGN.md](docs/DESIGN.md) for why the evidence comes from interception events rather than a listening socket).
+- **Bounded load.** At most `RENDER_CONCURRENCY` renders run at once, `RENDER_QUEUE` more may wait, and everything beyond that gets `429` immediately. A timed-out render closes its tab.
+- **Contained.** Each render gets its own tab in a shared browser and nothing is kept between renders. If the browser dies, the next request starts a new one.
 
-**Provided by the Chromium engine milestone** (behaviour verified in a spike, see [docs/DESIGN.md](docs/DESIGN.md))
+**Provided by the Docker image milestone**
 
-- **No scripts, no network.** JavaScript is disabled and every request the page makes (stylesheets, images, fonts, frames, `fetch`) is intercepted and failed. The service never loads a URL. `data:` URIs work, so logos and small graphics can be inlined.
-- **Contained.** Each render gets its own page in a shared browser, and the browser runs as a non-root user in the container.
+- The browser runs as a non-root user with the Chromium sandbox on. Until then `CHROMIUM_NO_SANDBOX` exists only for hosts that cannot grant the sandbox its privileges; leave it unset on a normal host.
 
 ## Configuration
 
@@ -152,34 +154,44 @@ pressroom renders HTML written by someone else, so the page is treated as untrus
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `MAX_BODY_BYTES` | `2097152` | request body limit (1024 to 67108864) |
 | `RENDER_TIMEOUT` | `20s` | per-render time limit (1s to 2m) |
+| `CHROME_PATH` | auto-detect | Chrome, Chromium or chrome-headless-shell binary |
+| `CHROMIUM_NO_SANDBOX` | `false` | disable the Chromium sandbox (containers that cannot provide it) |
+| `RENDER_CONCURRENCY` | `2` | renders that run at once (1 to 16) |
+| `RENDER_QUEUE` | `4` | renders allowed to wait for a free slot (0 to 100); more get `429` |
 
 Copy `.env.example` for a starting point and never commit a real token. Generate one with `openssl rand -hex 32`.
 
 ## Run it
 
-Needs Go 1.22 or newer. The steps are the same on macOS, Ubuntu and Fedora; only installing Go differs.
+Needs Go 1.22 or newer and a Chrome or Chromium binary. The steps are the same on macOS, Ubuntu and Fedora; only installing Go and the browser differs (Docker image coming, which bundles both).
 
 ```sh
 export PRESSROOM_TOKEN="$(openssl rand -hex 32)"
-make run                 # go run ./cmd/pressroom
+export CHROME_PATH="/path/to/chrome"   # omit if chrome or chromium is on PATH
+make run                               # go run ./cmd/pressroom
 curl -s localhost:8080/health
+curl -s localhost:8080/ready           # 200 once the browser answers
 ```
+
+The browser starts on the first render (or the first `/ready`), so the first request pays about half a second more. Han characters need a CJK font on the host; without one they print as empty boxes.
 
 ## Development
 
 ```sh
 make check               # gofmt, go vet, tests with the race detector, build
-make test                # tests only
+make test                # tests only, no browser needed
+make e2e                 # also drives a real browser; needs CHROME_PATH
 ```
 
-The tests use a fake renderer, so they need no browser. They cover configuration (including that the token is never echoed), authentication, strict JSON handling, every option range, error mapping with `Retry-After`, the render deadline, panic recovery, and that logs never contain request content.
+The default tests use a fake renderer, so they need no browser. `make e2e` runs the same suite with `PRESSROOM_E2E=1` against the real engine: three-page Han and Vietnamese sample, page-number footers, a hostile page, request timeout, full queue, concurrent renders, a killed browser, and shutdown. The unit tests cover configuration (including that the token is never echoed), authentication, strict JSON handling, every option range, error mapping with `Retry-After`, the render deadline, panic recovery, and that logs never contain request content.
 
 ```
 cmd/pressroom        entry point (wiring only)
 internal/config      environment configuration, fails fast
 internal/api         HTTP handlers and request validation
 internal/middleware  authentication, request log, panic recovery
-internal/render      the Renderer interface, an unavailable renderer, a test double
+internal/render      the Renderer interface, the Chromium engine, a test double
+internal/limits      concurrency limit with a bounded queue
 docs/API.md          the contract
 docs/DESIGN.md       decisions and measurements
 ```
@@ -187,8 +199,8 @@ docs/DESIGN.md       decisions and measurements
 ## Roadmap
 
 - [x] API, authentication, validation, errors, logs, CI
-- [ ] Chromium engine with scripts disabled and all requests blocked, plus integration tests
-- [ ] Concurrency limit with a bounded queue, graceful drain of in-flight renders, browser crash recovery
+- [x] Chromium engine with scripts disabled and all requests blocked, plus integration tests
+- [x] Concurrency limit with a bounded queue, graceful drain of in-flight renders, browser crash recovery
 - [ ] Docker image with fonts (Noto Serif, Noto Serif CJK, Noto Sans), non-root, sandbox on
 - [ ] Deployment notes for private networking, a sample client and a contract test
 - [ ] First tagged release

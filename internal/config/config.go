@@ -21,6 +21,14 @@ type Config struct {
 	LogLevel      slog.Level
 	MaxBodyBytes  int64
 	RenderTimeout time.Duration
+	// ChromePath is the browser binary; empty lets the renderer look one up.
+	ChromePath string
+	// NoSandbox turns the Chromium sandbox off (CHROMIUM_NO_SANDBOX=true).
+	NoSandbox bool
+	// Concurrency is how many renders run at once.
+	Concurrency int
+	// QueueSize is how many more renders may wait for a free slot.
+	QueueSize int
 }
 
 // Load reads the configuration through getenv (os.Getenv in production).
@@ -30,6 +38,9 @@ func Load(getenv func(string) string) (Config, error) {
 		Token:         getenv("PRESSROOM_TOKEN"),
 		MaxBodyBytes:  2 << 20,
 		RenderTimeout: 20 * time.Second,
+		ChromePath:    getenv("CHROME_PATH"),
+		Concurrency:   2,
+		QueueSize:     4,
 	}
 
 	if cfg.Token == "" {
@@ -61,6 +72,27 @@ func Load(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("RENDER_TIMEOUT %q must be a duration from 1s to 2m", v)
 		}
 		cfg.RenderTimeout = d
+	}
+	if v := getenv("CHROMIUM_NO_SANDBOX"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("CHROMIUM_NO_SANDBOX %q must be true or false", v)
+		}
+		cfg.NoSandbox = b
+	}
+	if v := getenv("RENDER_CONCURRENCY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 16 {
+			return Config{}, fmt.Errorf("RENDER_CONCURRENCY %q must be a whole number from 1 to 16", v)
+		}
+		cfg.Concurrency = n
+	}
+	if v := getenv("RENDER_QUEUE"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 100 {
+			return Config{}, fmt.Errorf("RENDER_QUEUE %q must be a whole number from 0 to 100", v)
+		}
+		cfg.QueueSize = n
 	}
 	return cfg, nil
 }
