@@ -47,6 +47,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - name: build
         run: docker build -t pressroom:ci .
       - name: browser starts and answers
@@ -60,3 +63,8 @@ jobs:
           done
           docker logs pressroom
           exit 1
+      - name: contract test against the image
+        env:
+          PRESSROOM_URL: http://localhost:8080
+          PRESSROOM_TOKEN: ci-token-0123456789abcdef
+        run: make contract
