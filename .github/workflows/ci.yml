@@ -24,3 +24,21 @@ jobs:
         run: go test -race -count=1 ./...
       - name: build
         run: go build ./...
+
+  # Drives the installed Chrome. Not required to pass yet: the runner's sandbox
+  # and CJK fonts have not been confirmed, so this reports without blocking.
+  e2e:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: fonts
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk fonts-noto-core
+      - name: browser tests
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+          CHROMIUM_NO_SANDBOX: "true"
+        run: make e2e

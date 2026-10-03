@@ -42,8 +42,27 @@ A lesson worth keeping for tests: when a page is loaded through `Page.setDocumen
 - Give headings `break-after: avoid`; in the sample a heading was stranded at the bottom of a page.
 - A page background set on `body` fills the content area, not the page margins. For a full-bleed colour use `@page { margin: 0 }` and pad the content.
 
+## Verified in the service
+
+The same rules now run in the service and are covered by tests that start a real browser (`make e2e`). Results below are from macOS with Chrome 154 and with Playwright's chrome-headless-shell; both pass the whole suite three times in a row.
+
+- The hostile page: stylesheet, background image, web font, image and iframe requests are all intercepted, and a script that calls `fetch` or an `onload` handler produces no request. An inline `data:` image is not refused.
+- A three-page Han and Vietnamese sample renders in about 60 to 100 ms once the browser is running (0.4 to 1.1 s including the first start). Page-number footers show `n of 3` on every page.
+- Four concurrent renders keep their own content apart.
+- A render that exceeds its deadline returns `context.DeadlineExceeded`, closes its tab, and the browser keeps working.
+- Killing the browser process is detected on the next request and replaced by a new browser; no request fails in between in the test.
+- A full queue is turned away at once (`ErrBusy`, mapped to `429`).
+
+Findings that shaped the code:
+
+- **No separate browser context per render.** Opening a tab in a new browser context fails in Chrome's new headless mode with "no browser is open", so each render uses its own tab in the default context. Scripts are off and every request is refused, so a page has nothing to store or fetch; the tab is closed after the render.
+- **Interception events are the evidence** (see above), so the engine takes an optional callback that receives each refused URL; production leaves it unset and only a count is logged at debug level.
+- **Header and footer templates.** When only one of them is set, the other is replaced with an empty element, otherwise Chrome prints its default date and title banner.
+- **Graceful shutdown.** `http.Server.Shutdown` makes `ListenAndServe` return at once, so the process waits for the drain to finish before closing the browser; the drain allows the render timeout plus a margin.
+
 ## Not yet verified
 
-- Running the browser as a non-root user with the sandbox on (the spike ran as root with `--no-sandbox`).
-- Two concurrent renders and recovery after a browser crash.
-- Memory on the target hosting plan.
+- Running the browser as a non-root user with the sandbox on (the spike ran as root with `--no-sandbox`; the tests here run on a developer machine).
+- Behaviour of the engine inside the Linux container image (comes with the image milestone).
+- The CI browser job: the runner's sandbox and CJK fonts are not confirmed, so it is allowed to fail.
+- Memory and throughput on the target hosting plan.
