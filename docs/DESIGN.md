@@ -9,7 +9,7 @@ Why pressroom is built the way it is, and what was measured before building it. 
 | Own service or Gotenberg? | A small own service | The contract stays tiny (HTML in, PDF out), the limits and the security model are explicit and testable, and Gotenberg could replace it later without changing callers. |
 | Who builds the HTML? | The caller | pressroom has no templates and no domain knowledge. It never accepts a URL, so there is nothing to fetch. |
 | Chromium driver | chromedp | Actions run in order, so request interception is enabled before the document is set. go-rod's router starts asynchronously; in the spike it intercepted 1 of the 5 requests of a hostile page, against 5 of 5 for chromedp. Both produced identical PDFs. |
-| Base image | `chromedp/headless-shell` plus fonts | A lean browser: container peak memory was 77 MB without fonts and 137 MB with fonts after ten sequential three-page renders. |
+| Base image | `chromedp/headless-shell` (pinned to 151.0.7922.109) plus fonts | A lean browser: container peak memory was 77 MB without fonts and 137 MB with fonts after ten sequential three-page renders. |
 | Network access for rendered pages | none | Every request is intercepted and failed; scripts are disabled. |
 
 ## Fonts are part of the contract
@@ -60,9 +60,27 @@ Findings that shaped the code:
 - **Header and footer templates.** When only one of them is set, the other is replaced with an empty element, otherwise Chrome prints its default date and title banner.
 - **Graceful shutdown.** `http.Server.Shutdown` makes `ListenAndServe` return at once, so the process waits for the drain to finish before closing the browser; the drain allows the render timeout plus a margin.
 
+## The image
+
+Measured on a Linux arm64 container (Docker via Colima, 4 GB), running locked down: non-root, `--read-only`, `--tmpfs /tmp`, `--cap-drop ALL`, `--security-opt no-new-privileges`.
+
+| Item | Result |
+|---|---|
+| Image size | 636 MB (pinned headless-shell base plus 60 MB of fonts and an 8 MB binary) |
+| Fonts | only Noto Serif, Noto Sans (four styles each) and Noto Serif CJK SC (Regular and Bold) are kept; installing and pruning share one layer. The unpruned packages add about 136 MB |
+| Sample document through HTTP | 3 pages, 27 Han characters, Vietnamese diacritics; `NotoSerif`, `NotoSerifCJKsc` and `NotoSans` embedded; 37 to 51 ms warm |
+| Memory | 83 MiB after the first renders, 88 MiB after 20 more, 103 MiB peak (cgroup `memory.peak`) |
+| Burst of 12 parallel requests (concurrency 2, queue 4) | 6 times 200, 6 times 429; `/ready` stayed 200 |
+| Browser processes | six, all running as UID 10001 |
+| Build from a copy of only the tracked files | works; `/ready` 200 |
+
+**The sandbox cannot be on in the image.** As a non-root user with Docker's default seccomp profile the browser exits at start with "No usable sandbox" (`/ready` stays 503). With `--security-opt seccomp=unconfined` the same image starts with the sandbox on, so the cause is user namespaces being blocked, not the image. The headless-shell build has no setuid `chrome-sandbox` helper to fall back on, and a hosted platform cannot change the seccomp profile, so the image sets `CHROMIUM_NO_SANDBOX=true`. The remaining controls are listed in the README's security model.
+
+`font-family` resolution: `fc-match` maps `Noto Serif`, `Noto Serif CJK SC`, `Noto Sans` and the generic `serif` and `sans-serif` to the bundled files; `docker/fonts.conf` adds the generic mappings.
+
 ## Not yet verified
 
-- Running the browser as a non-root user with the sandbox on (the spike ran as root with `--no-sandbox`; the tests here run on a developer machine).
-- Behaviour of the engine inside the Linux container image (comes with the image milestone).
+- The image on amd64 (built and measured on arm64 only).
+- Running the Go browser tests (`make e2e`) inside the container; the HTTP-level checks cover the same paths.
 - The CI browser job: the runner's sandbox and CJK fonts are not confirmed, so it is allowed to fail.
 - Memory and throughput on the target hosting plan.

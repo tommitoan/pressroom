@@ -1,4 +1,4 @@
-.PHONY: build test e2e vet fmt fmt-check run tidy check
+.PHONY: build test e2e docker-build docker-run vet fmt fmt-check run tidy check
 
 build:
 	go build -o bin/pressroom ./cmd/pressroom
@@ -9,6 +9,13 @@ test:
 # Drives a real browser; set CHROME_PATH (and CHROMIUM_NO_SANDBOX=true where needed).
 e2e:
 	PRESSROOM_E2E=1 go test -race -count=1 ./internal/render
+
+docker-build:
+	docker build -t pressroom:local .
+
+# Needs PRESSROOM_TOKEN in the environment (at least 16 characters).
+docker-run:
+	docker run --rm -p 8080:8080 -e PRESSROOM_TOKEN pressroom:local
 
 vet:
 	go vet ./...
