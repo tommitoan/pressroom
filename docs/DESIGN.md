@@ -52,13 +52,20 @@ The same rules now run in the service and are covered by tests that start a real
 - A render that exceeds its deadline returns `context.DeadlineExceeded`, closes its tab, and the browser keeps working.
 - Killing the browser process is detected on the next request and replaced by a new browser; no request fails in between in the test.
 - A full queue is turned away at once (`ErrBusy`, mapped to `429`).
+- Through the real HTTP handler: a burst of 10 requests with 1 running and 1 queued gave 2 renders and 8 rejections, the slowest rejection in 81 ms; `/ready` stayed 200 and the next render worked.
+- Through the real HTTP handler: the hostile page returns a PDF with every request intercepted; a 40 ms deadline gives `504 render_timeout` and the browser stays healthy; malformed JSON, unknown fields, bad options, a wrong or missing token and an oversized body are refused without echoing the token and without harming the service.
+- After a browser killed without being reaped, a restart and a close: no defunct child process and no leftover `chromedp-runner*` profile directory (a control confirms the directory exists while the browser runs). After 15 renders and a timed-out one, only the initial tab is open.
+- `SIGTERM` during a render: the request completed with 200 and a PDF, the process exited with code 0 right after, and no browser was left running.
 
 Findings that shaped the code:
 
 - **No separate browser context per render.** Opening a tab in a new browser context fails in Chrome's new headless mode with "no browser is open", so each render uses its own tab in the default context. Scripts are off and every request is refused, so a page has nothing to store or fetch; the tab is closed after the render.
 - **Interception events are the evidence** (see above), so the engine takes an optional callback that receives each refused URL; production leaves it unset and only a count is logged at debug level.
+- **Cancelled requests used to leak tabs.** chromedp creates a tab with the context it is given; when that context was cancelled in flight the browser still opened the tab but chromedp never learned its id, so it was never closed. In a loop of 60 renders cancelled after 1 to 20 ms, 47 tabs stayed open on Chrome and 4 on headless-shell. The tab is now created with a context that does not depend on the request, the request's cancellation is attached afterwards, and `closeTab` checks that the tab is gone and repeats the close if not (chromedp's own close occasionally leaves a just-created tab open without reporting an error). Both leak tests fail without the fix and leave exactly one tab with it, on macOS Chrome, headless-shell and Linux headless-shell.
+- **Printing waits for the page's load event.** Without it a fast machine could print before the parser had issued the page's requests, so the evidence of what was refused varied from run to run (the hostile-page test failed about one run in three on Linux). The wait costs nothing measurable. Inline `data:` images were never lost, with or without it (40 renders per browser).
 - **Header and footer templates.** When only one of them is set, the other is replaced with an empty element, otherwise Chrome prints its default date and title banner.
-- **Graceful shutdown.** `http.Server.Shutdown` makes `ListenAndServe` return at once, so the process waits for the drain to finish before closing the browser; the drain allows the render timeout plus a margin.
+- **Graceful shutdown.** `http.Server.Shutdown` makes `Serve` return at once, so `serve()` waits for the drain to finish before the browser is closed; the drain allows the render timeout plus 5 s. It is a function of its own so tests can run it with a slow handler.
+- **Header limit.** `net/http` reads 4 KiB beyond `MaxHeaderBytes` before answering 431, so the effective limit is about 20 KiB.
 
 ## The image
 

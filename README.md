@@ -107,24 +107,29 @@ Only `html` is required. Errors are always JSON and never contain the request:
 | 504 | `render_timeout` | the render took too long |
 | 500 | `render_failed`, `internal_error` | anything else |
 
-### A Go client in a few lines
+### A Go client
+
+[`examples/client`](examples/client) holds a small client that uses only the Go standard library. Copy `client.go` into the service that needs PDFs:
 
 ```go
-func pdf(ctx context.Context, base, token, html string) ([]byte, error) {
-    body, _ := json.Marshal(map[string]any{"html": html})
-    req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/pdf", bytes.NewReader(body))
-    req.Header.Set("Authorization", "Bearer "+token)
-    req.Header.Set("Content-Type", "application/json")
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil {
-        return nil, err
-    }
-    defer resp.Body.Close()
-    if resp.StatusCode != http.StatusOK {
-        return nil, fmt.Errorf("pressroom: status %d", resp.StatusCode)
-    }
-    return io.ReadAll(resp.Body)
+c := client.New(os.Getenv("PRESSROOM_URL"), os.Getenv("PRESSROOM_TOKEN"))
+pdf, err := c.PDF(ctx, html, &client.Options{Paper: "A4", FooterHTML: footer})
+
+var apiErr *client.APIError
+if errors.As(err, &apiErr) {
+    log.Printf("pressroom said %s (%d)", apiErr.Code, apiErr.Status)
 }
+```
+
+It returns the service's error code in a typed error, keeps options you leave unset at the service defaults (a margin of `0` and `print_background: false` are sent when you ask for them), and retries only `429 busy` and `503 unavailable`, after the `Retry-After` the service sends.
+
+### A contract test
+
+[`examples/client/contract_test.go`](examples/client/contract_test.go) checks, over plain HTTP, what a caller can rely on: the probes, authentication, a valid document with and without every option, remote content that is not fetched, every error code and that the answers never repeat the request, and the client itself against the service. It skips unless `PRESSROOM_URL` and `PRESSROOM_TOKEN` are set; the CI image job runs it against the built image. Copy it next to `client.go` in a consumer and run it after changing either side.
+
+```sh
+make docker-build && make docker-run              # in one terminal
+PRESSROOM_URL=http://localhost:8080 PRESSROOM_TOKEN="$PRESSROOM_TOKEN" make contract
 ```
 
 ## Security model
@@ -165,6 +170,8 @@ Copy `.env.example` for a starting point and never commit a real token. Generate
 
 ## Run it
 
+To run it as a private service on Railway see [docs/DEPLOY.md](docs/DEPLOY.md), which also has a troubleshooting table (fonts, memory, `429`, `504`).
+
 ### With Docker
 
 The steps are the same on macOS, Ubuntu and Fedora; only installing Docker differs.
@@ -199,7 +206,7 @@ make test                # tests only, no browser needed
 make e2e                 # also drives a real browser; needs CHROME_PATH
 ```
 
-The default tests use a fake renderer, so they need no browser. `make e2e` runs the same suite with `PRESSROOM_E2E=1` against the real engine: three-page Han and Vietnamese sample, page-number footers, a hostile page, request timeout, full queue, concurrent renders, a killed browser, and shutdown. The unit tests cover configuration (including that the token is never echoed), authentication, strict JSON handling, every option range, error mapping with `Retry-After`, the render deadline, panic recovery, and that logs never contain request content.
+The default tests use a fake renderer, so they need no browser. `make e2e` runs the same suite with `PRESSROOM_E2E=1` against the real engine, directly and through the HTTP handler: three-page Han and Vietnamese sample, page-number footers, margins, a hostile page, request timeout, a burst above the queue, concurrent renders, bad and oversized requests, a killed browser, and no leftover processes, profiles or tabs. Graceful shutdown is tested with a slow handler. Every documented limit is mapped to its test in [docs/API.md](docs/API.md#limits). The unit tests cover configuration (including that the token is never echoed), authentication, strict JSON handling, every option range, error mapping with `Retry-After`, the render deadline, panic recovery, and that logs never contain request content.
 
 ```
 cmd/pressroom        entry point (wiring only)
@@ -209,6 +216,9 @@ internal/middleware  authentication, request log, panic recovery
 internal/render      the Renderer interface, the Chromium engine, a test double
 internal/limits      concurrency limit with a bounded queue
 Dockerfile           image: pinned headless-shell, pruned fonts, non-root
+railway.toml         Railway build and health check
+examples/client      Go client and contract test, standard library only
+docs/DEPLOY.md       private deployment on Railway and troubleshooting
 docker/fonts.conf    maps serif and sans-serif to the bundled fonts
 docs/API.md          the contract
 docs/DESIGN.md       decisions and measurements
@@ -220,7 +230,7 @@ docs/DESIGN.md       decisions and measurements
 - [x] Chromium engine with scripts disabled and all requests blocked, plus integration tests
 - [x] Concurrency limit with a bounded queue, graceful drain of in-flight renders, browser crash recovery
 - [x] Docker image with fonts (Noto Serif, Noto Serif CJK, Noto Sans) and a non-root user; the sandbox cannot be on under Docker's default seccomp profile
-- [ ] Deployment notes for private networking, a sample client and a contract test
+- [x] Deployment notes for private networking, a sample client and a contract test (not yet run on Railway itself)
 - [ ] First tagged release
 
 ## Licence

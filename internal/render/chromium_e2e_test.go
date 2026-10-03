@@ -3,15 +3,23 @@ package render
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/chromedp/chromedp"
 	"github.com/ledongthuc/pdf"
 )
 
@@ -358,6 +366,200 @@ func TestE2EMarginsAreApplied(t *testing.T) {
 		wantPt := leftMM / 25.4 * 72
 		if minX < wantPt-1 || minX > wantPt+6 {
 			t.Errorf("left margin %.0f mm: text starts at %.1f pt, want about %.1f pt", leftMM, minX, wantPt)
+		}
+	}
+}
+
+// profileDirs lists the temporary browser profiles currently on disk.
+func profileDirs(t *testing.T) map[string]bool {
+	t.Helper()
+	dirs, err := filepath.Glob(filepath.Join(os.TempDir(), "chromedp-runner*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := map[string]bool{}
+	for _, d := range dirs {
+		set[d] = true
+	}
+	return set
+}
+
+// zombieChildren returns the defunct child processes of this test process.
+func zombieChildren(t *testing.T) []string {
+	t.Helper()
+	out, err := exec.Command("ps", "-A", "-o", "pid=,ppid=,stat=,comm=").Output()
+	if err != nil {
+		t.Skipf("ps is not available: %v", err)
+	}
+	var zombies []string
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 {
+			continue
+		}
+		if ppid, _ := strconv.Atoi(f[1]); ppid == os.Getpid() && strings.HasPrefix(f[2], "Z") {
+			zombies = append(zombies, strings.TrimSpace(line))
+		}
+	}
+	return zombies
+}
+
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: not true within 5s", what)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestE2ENoZombiesOrProfilesLeftAfterCrashRestartAndClose(t *testing.T) {
+	before := profileDirs(t)
+	c := newE2E(t, nil)
+	html := fixture(t, "sample.html")
+	render(t, c, html, e2eOptions())
+
+	// Control: the profile directory exists while the browser runs, so finding
+	// it gone later means something.
+	running := 0
+	for d := range profileDirs(t) {
+		if !before[d] {
+			running++
+		}
+	}
+	if running == 0 {
+		t.Fatal("no temporary browser profile found while the browser runs; the cleanup check below would prove nothing")
+	}
+
+	sess, err := c.session(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	proc := browserProcess(sess)
+	if proc == nil {
+		t.Fatal("no browser process to kill")
+	}
+	// Kill without waiting: reaping the dead process is the service's job.
+	if err := proc.Kill(); err != nil {
+		t.Fatal(err)
+	}
+
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, err := c.Render(ctx, Request{HTML: html, Options: e2eOptions()})
+		cancel()
+		if err == nil {
+			break
+		}
+		if attempt == 2 {
+			t.Fatalf("no render succeeded after the crash: %v", err)
+		}
+	}
+
+	c.Close()
+
+	eventually(t, "no defunct child processes", func() bool { return len(zombieChildren(t)) == 0 })
+	eventually(t, "the temporary browser profiles are removed", func() bool {
+		for d := range profileDirs(t) {
+			if !before[d] {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// openPages counts the page targets the browser currently has.
+func openPages(sess *session) (int, error) {
+	infos, err := chromedp.Targets(sess.ctx)
+	if err != nil {
+		return 0, err
+	}
+	pages := 0
+	for _, in := range infos {
+		if in.Type == "page" {
+			pages++
+		}
+	}
+	return pages, nil
+}
+
+func TestE2ERendersDoNotLeakTabs(t *testing.T) {
+	c := newE2E(t, nil)
+	html := fixture(t, "sample.html")
+	for i := 0; i < 15; i++ {
+		render(t, c, html, e2eOptions())
+	}
+
+	sess, err := c.session(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "only the initial tab remains open after normal renders", func() bool {
+		n, err := openPages(sess)
+		return err == nil && n <= 1
+	})
+}
+
+// A request that is cancelled while its tab is being created must not leave
+// the tab behind. The deadlines sweep from far too short to almost enough, so
+// the cancellation lands in every phase of a render.
+func TestE2ECancelledRendersDoNotLeakTabs(t *testing.T) {
+	c := newE2E(t, nil)
+	html := fixture(t, "sample.html")
+	render(t, c, html, e2eOptions())
+
+	for i := 0; i < 60; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(i%20+1)*time.Millisecond)
+		_, _ = c.Render(ctx, Request{HTML: html, Options: e2eOptions()})
+		cancel()
+	}
+
+	sess, err := c.session(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var last int
+	eventually(t, "only the initial tab remains open after cancelled renders", func() bool {
+		n, err := openPages(sess)
+		last = n
+		return err == nil && n <= 1
+	})
+	t.Logf("open pages at the end: %d", last)
+	render(t, c, html, e2eOptions()) // and the browser still works
+}
+
+// A document with inline images must come out with all of them, every time:
+// printing may not start before the page has finished loading its content.
+func TestE2EInlineImagesAreAlwaysPrinted(t *testing.T) {
+	c := newE2E(t, nil)
+
+	img := image.NewRGBA(image.Rect(0, 0, 400, 400))
+	for y := 0; y < 400; y++ {
+		for x := 0; x < 400; x++ {
+			img.Set(x, y, color.RGBA{uint8(x), uint8(y), uint8(x ^ y), 255})
+		}
+	}
+	var png64 bytes.Buffer
+	enc := base64.NewEncoder(base64.StdEncoding, &png64)
+	if err := png.Encode(enc, img); err != nil {
+		t.Fatal(err)
+	}
+	enc.Close()
+
+	var html strings.Builder
+	html.WriteString("<!doctype html><meta charset=utf-8><body style='margin:0'>")
+	const images = 4
+	for i := 0; i < images; i++ {
+		fmt.Fprintf(&html, `<img alt="" width="200" height="200" src="data:image/png;base64,%s">`, png64.String())
+	}
+
+	for run := 0; run < 40; run++ {
+		pdfBytes := render(t, c, html.String(), e2eOptions())
+		if got := bytes.Count(pdfBytes, []byte("/Subtype /Image")); got < 1 {
+			t.Fatalf("run %d: the PDF has no image although the page has %d inline images", run, images)
 		}
 	}
 }

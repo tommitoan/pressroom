@@ -1,4 +1,4 @@
-.PHONY: build test e2e docker-build docker-run vet fmt fmt-check run tidy check
+.PHONY: build test e2e contract docker-build docker-run vet fmt fmt-check run tidy check
 
 build:
 	go build -o bin/pressroom ./cmd/pressroom
@@ -8,7 +8,11 @@ test:
 
 # Drives a real browser; set CHROME_PATH (and CHROMIUM_NO_SANDBOX=true where needed).
 e2e:
-	PRESSROOM_E2E=1 go test -race -count=1 ./internal/render
+	PRESSROOM_E2E=1 go test -race -count=1 ./internal/render ./internal/api
+
+# Runs the contract test against a running service: PRESSROOM_URL and PRESSROOM_TOKEN must be set.
+contract:
+	go test -count=1 -v -run Contract ./examples/client
 
 docker-build:
 	docker build -t pressroom:local .
