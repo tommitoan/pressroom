@@ -125,3 +125,22 @@ func TestPrintParamsRejectsUnknownPaper(t *testing.T) {
 		t.Error("an unknown paper must be an error")
 	}
 }
+
+func TestHasTwoGlyphsAfter(t *testing.T) {
+	for name, tc := range map[string]struct {
+		text string
+		want bool
+	}{
+		"exact characters":        {"Tuổi\n3–12\n壬午\nThương quan", true},
+		"raw glyph codes":         {"Tuổi\n3–12\n½Á\nThương quan", true},
+		"empty cell":              {"Tuổi\n3–12\n\nThương quan", false},
+		"one glyph":               {"Tuổi\n3–12\n½\nThương quan", false},
+		"three glyphs":            {"Tuổi\n3–12\n½ÁÂ\nThương quan", false},
+		"marker missing":          {"Tuổi\n13–22\n½Á", false},
+		"marker on the last line": {"Tuổi\n3–12", false},
+	} {
+		if got := hasTwoGlyphsAfter(tc.text, "3–12"); got != tc.want {
+			t.Errorf("%s: got %v, want %v", name, got, tc.want)
+		}
+	}
+}

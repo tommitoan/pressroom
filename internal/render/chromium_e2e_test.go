@@ -112,13 +112,33 @@ func TestE2ESampleRendersThreePages(t *testing.T) {
 			t.Errorf("%s: %d pages, want 3", name, len(pages))
 			continue
 		}
-		if !strings.Contains(pages[1], "壬午") {
-			t.Errorf("%s: page 2 lost its Han text: %q", name, pages[1])
+		if !hasTwoGlyphsAfter(pages[1], "3–12") {
+			t.Errorf("%s: page 2 lost the Han characters of the first table row: %q", name, pages[1])
 		}
 		if !strings.Contains(pages[0], "mẫu") {
 			t.Errorf("%s: page 1 lost its Vietnamese text: %q", name, pages[0])
 		}
 	}
+}
+
+// hasTwoGlyphsAfter reports whether the line after the one holding marker has
+// two characters, the pair 壬午 in the sample. The PDF reader maps Han glyphs
+// back to Unicode on some systems and returns raw glyph codes on others (CID
+// fonts), so the exact characters cannot be compared everywhere; a dropped
+// pair would leave the line empty. That the characters are real glyphs from the
+// CJK font is checked on the built image with a different extractor.
+func hasTwoGlyphsAfter(text, marker string) bool {
+	lines := strings.Split(text, "\n")
+	for i, l := range lines {
+		if strings.TrimSpace(l) == marker && i+1 < len(lines) {
+			next := lines[i+1]
+			if next == "壬午" {
+				return true
+			}
+			return len([]rune(next)) == 2
+		}
+	}
+	return false
 }
 
 func TestE2EFooterShowsPageNumbers(t *testing.T) {
