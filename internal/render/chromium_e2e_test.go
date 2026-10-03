@@ -3,8 +3,12 @@ package render
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -467,32 +471,95 @@ func TestE2ENoZombiesOrProfilesLeftAfterCrashRestartAndClose(t *testing.T) {
 	})
 }
 
+// openPages counts the page targets the browser currently has.
+func openPages(sess *session) (int, error) {
+	infos, err := chromedp.Targets(sess.ctx)
+	if err != nil {
+		return 0, err
+	}
+	pages := 0
+	for _, in := range infos {
+		if in.Type == "page" {
+			pages++
+		}
+	}
+	return pages, nil
+}
+
 func TestE2ERendersDoNotLeakTabs(t *testing.T) {
 	c := newE2E(t, nil)
 	html := fixture(t, "sample.html")
 	for i := 0; i < 15; i++ {
 		render(t, c, html, e2eOptions())
 	}
-	// A timed-out render must not leave its tab behind either.
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
-	_, _ = c.Render(ctx, Request{HTML: html, Options: e2eOptions()})
-	cancel()
 
 	sess, err := c.session(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "only the initial tab remains open", func() bool {
-		infos, err := chromedp.Targets(sess.ctx)
-		if err != nil {
-			return false
-		}
-		pages := 0
-		for _, in := range infos {
-			if in.Type == "page" {
-				pages++
-			}
-		}
-		return pages <= 1
+	eventually(t, "only the initial tab remains open after normal renders", func() bool {
+		n, err := openPages(sess)
+		return err == nil && n <= 1
 	})
+}
+
+// A request that is cancelled while its tab is being created must not leave
+// the tab behind. The deadlines sweep from far too short to almost enough, so
+// the cancellation lands in every phase of a render.
+func TestE2ECancelledRendersDoNotLeakTabs(t *testing.T) {
+	c := newE2E(t, nil)
+	html := fixture(t, "sample.html")
+	render(t, c, html, e2eOptions())
+
+	for i := 0; i < 60; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(i%20+1)*time.Millisecond)
+		_, _ = c.Render(ctx, Request{HTML: html, Options: e2eOptions()})
+		cancel()
+	}
+
+	sess, err := c.session(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var last int
+	eventually(t, "only the initial tab remains open after cancelled renders", func() bool {
+		n, err := openPages(sess)
+		last = n
+		return err == nil && n <= 1
+	})
+	t.Logf("open pages at the end: %d", last)
+	render(t, c, html, e2eOptions()) // and the browser still works
+}
+
+// A document with inline images must come out with all of them, every time:
+// printing may not start before the page has finished loading its content.
+func TestE2EInlineImagesAreAlwaysPrinted(t *testing.T) {
+	c := newE2E(t, nil)
+
+	img := image.NewRGBA(image.Rect(0, 0, 400, 400))
+	for y := 0; y < 400; y++ {
+		for x := 0; x < 400; x++ {
+			img.Set(x, y, color.RGBA{uint8(x), uint8(y), uint8(x ^ y), 255})
+		}
+	}
+	var png64 bytes.Buffer
+	enc := base64.NewEncoder(base64.StdEncoding, &png64)
+	if err := png.Encode(enc, img); err != nil {
+		t.Fatal(err)
+	}
+	enc.Close()
+
+	var html strings.Builder
+	html.WriteString("<!doctype html><meta charset=utf-8><body style='margin:0'>")
+	const images = 4
+	for i := 0; i < images; i++ {
+		fmt.Fprintf(&html, `<img alt="" width="200" height="200" src="data:image/png;base64,%s">`, png64.String())
+	}
+
+	for run := 0; run < 40; run++ {
+		pdfBytes := render(t, c, html.String(), e2eOptions())
+		if got := bytes.Count(pdfBytes, []byte("/Subtype /Image")); got < 1 {
+			t.Fatalf("run %d: the PDF has no image although the page has %d inline images", run, images)
+		}
+	}
 }
