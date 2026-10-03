@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chromedp/cdproto/browser"
@@ -14,6 +15,7 @@ import (
 	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 
 	"github.com/tommitoan/pressroom/internal/limits"
@@ -259,8 +261,29 @@ func alive(s *session) bool {
 // number of page requests that were refused.
 func (c *Chromium) print(ctx context.Context, sess *session, html string, params *page.PrintToPDFParams) ([]byte, int, error) {
 	tabCtx, cancelTab := chromedp.NewContext(sess.ctx)
-	defer cancelTab()
-	// Closing the tab is what stops Chromium working on a request that timed out.
+	var tabID target.ID
+	defer func() {
+		cancelTab()
+		closeTab(sess, tabID)
+	}()
+
+	// Create the tab before the request's cancellation is attached. If the
+	// create call is cancelled in flight, the browser still opens the tab but
+	// chromedp never learns its id and so never closes it; every cancelled or
+	// timed-out request would then leak a tab. Creation is local and fast, so
+	// it only needs a bound of its own.
+	creating := time.AfterFunc(tabCreateTimeout, cancelTab)
+	err := chromedp.Run(tabCtx)
+	creating.Stop()
+	if err != nil {
+		return nil, 0, err
+	}
+	tabID = chromedp.FromContext(tabCtx).Target.TargetID
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	// From here, ending the request closes the tab, which is what stops
+	// Chromium working on a request that timed out.
 	stopWatch := context.AfterFunc(ctx, cancelTab)
 	defer stopWatch()
 
@@ -268,7 +291,20 @@ func (c *Chromium) print(ctx context.Context, sess *session, html string, params
 		mu      sync.Mutex
 		blocked int
 	)
+	// loaded is signalled when the page reports its load event for the content
+	// set below; earlier events belong to the blank page and are ignored.
+	var awaitingLoad atomic.Bool
+	loaded := make(chan struct{}, 1)
 	chromedp.ListenTarget(tabCtx, func(ev interface{}) {
+		if e, ok := ev.(*page.EventLifecycleEvent); ok {
+			if e.Name == "load" && awaitingLoad.Load() {
+				select {
+				case loaded <- struct{}{}:
+				default:
+				}
+			}
+			return
+		}
 		e, ok := ev.(*fetch.EventRequestPaused)
 		if !ok {
 			return
@@ -292,7 +328,7 @@ func (c *Chromium) print(ctx context.Context, sess *session, html string, params
 	})
 
 	var pdf []byte
-	err := chromedp.Run(tabCtx,
+	err = chromedp.Run(tabCtx,
 		emulation.SetScriptExecutionDisabled(true),
 		fetch.Enable().WithPatterns([]*fetch.RequestPattern{{URLPattern: "*"}}),
 		chromedp.Navigate("about:blank"),
@@ -301,7 +337,19 @@ func (c *Chromium) print(ctx context.Context, sess *session, html string, params
 			if err != nil {
 				return err
 			}
-			return page.SetDocumentContent(tree.Frame.ID, html).Do(ctx)
+			awaitingLoad.Store(true)
+			if err := page.SetDocumentContent(tree.Frame.ID, html).Do(ctx); err != nil {
+				return err
+			}
+			// Print only once the page has finished loading what it asked for.
+			// Every request is refused at once, so this is quick; without it a
+			// fast machine can print before the parser has issued the requests.
+			select {
+			case <-loaded:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}),
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			var err error
@@ -315,6 +363,35 @@ func (c *Chromium) print(ctx context.Context, sess *session, html string, params
 	return pdf, blocked, err
 }
 
+// closeTab makes sure the tab is gone. Cancelling the tab context already
+// asks the browser to close it, but a tab closed right after it was created
+// can be left open without any error, so the result is checked and the close
+// repeated. Each render pays one cheap call; a tab that is already closed
+// answers with an error, which ends the loop.
+func closeTab(sess *session, id target.ID) {
+	if id == "" {
+		return
+	}
+	c := chromedp.FromContext(sess.ctx)
+	if c == nil || c.Browser == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	exec := cdp.WithExecutor(ctx, c.Browser)
+	for attempt := 0; attempt < 5; attempt++ {
+		if _, err := target.GetTargetInfo().WithTargetID(id).Do(exec); err != nil {
+			return // the tab, or the whole browser, is gone
+		}
+		_ = target.CloseTarget(id).Do(exec)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 // paperInches maps a paper name to its size in inches (width, height).
 var paperInches = map[string][2]float64{
 	"A4":     {8.27, 11.69},
@@ -324,6 +401,9 @@ var paperInches = map[string][2]float64{
 }
 
 const emptyTemplate = "<span></span>"
+
+// tabCreateTimeout bounds opening a tab in a browser that is not answering.
+const tabCreateTimeout = 10 * time.Second
 
 // printParams maps validated options onto Chromium's print parameters.
 func printParams(o Options) (*page.PrintToPDFParams, error) {
