@@ -42,3 +42,21 @@ jobs:
           CHROME_PATH: /usr/bin/google-chrome
           CHROMIUM_NO_SANDBOX: "true"
         run: make e2e
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: docker build -t pressroom:ci .
+      - name: browser starts and answers
+        run: |
+          docker run -d --name pressroom -p 8080:8080 \
+            -e PRESSROOM_TOKEN=ci-token-0123456789abcdef pressroom:ci
+          for i in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/ready)"
+            [ "$code" = 200 ] && exit 0
+            sleep 1
+          done
+          docker logs pressroom
+          exit 1

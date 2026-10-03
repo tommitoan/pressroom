@@ -1,7 +1,7 @@
 # pressroom
 
 [![CI](https://github.com/tommitoan/pressroom/actions/workflows/ci.yml/badge.svg)](https://github.com/tommitoan/pressroom/actions/workflows/ci.yml)
-[![Go](https://img.shields.io/badge/go-1.22%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Go](https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/status-early%20development-orange.svg)](#roadmap)
 
@@ -15,7 +15,7 @@ curl -sS -X POST http://localhost:8080/v1/pdf \
   -o hello.pdf
 ```
 
-> **Status: early development.** The HTTP API, authentication, validation, limits and the Chromium rendering engine are done and tested end to end. The Docker image (fonts, non-root user) is the next milestone (see the [roadmap](#roadmap)). Without a Chrome or Chromium binary on the host, `POST /v1/pdf` answers `503 unavailable` and `GET /ready` answers `503`, on purpose, so the service never pretends to render.
+> **Status: early development.** The HTTP API, authentication, validation, limits and the Chromium rendering engine are done and tested end to end. A Docker image with the browser, fonts and a non-root user is included. Outside the image, without a Chrome or Chromium binary on the host, `POST /v1/pdf` answers `503 unavailable` and `GET /ready` answers `503`, on purpose, so the service never pretends to render.
 
 ## Why
 
@@ -38,7 +38,7 @@ It started as the export service for a personal web app, and was kept generic on
 | Done | Renderer behind an interface, with an honest "unavailable" implementation and a test double |
 | Done | Chromium engine: scripts disabled, every request intercepted and failed, one tab per render, browser started on first use and restarted if it dies |
 | Done | Concurrency limit with a bounded queue (fast `429` instead of waiting), graceful drain of in-flight renders on shutdown |
-| Next | Docker image with Han and Vietnamese-capable fonts, non-root |
+| Done | Docker image with the browser, only the needed Noto fonts (Han and Vietnamese), a non-root user |
 
 ## How it works
 
@@ -141,9 +141,11 @@ pressroom renders HTML written by someone else, so the page is treated as untrus
 - **Bounded load.** At most `RENDER_CONCURRENCY` renders run at once, `RENDER_QUEUE` more may wait, and everything beyond that gets `429` immediately. A timed-out render closes its tab.
 - **Contained.** Each render gets its own tab in a shared browser and nothing is kept between renders. If the browser dies, the next request starts a new one.
 
-**Provided by the Docker image milestone**
+**The Chromium sandbox is off in the image, on purpose**
 
-- The browser runs as a non-root user with the Chromium sandbox on. Until then `CHROMIUM_NO_SANDBOX` exists only for hosts that cannot grant the sandbox its privileges; leave it unset on a normal host.
+The sandbox needs user namespaces, and Docker's default seccomp profile blocks them; hosted platforms do not let a service change that. With the sandbox on, the browser in the image cannot start (checked: it starts when seccomp is relaxed). The image therefore sets `CHROMIUM_NO_SANDBOX=true` and relies on the other controls: a non-root user (UID 10001), scripts disabled, every page request refused, no files or network reachable from a page, a private network and a bearer token. If you control the host's seccomp profile, set `CHROMIUM_NO_SANDBOX=false`. Outside the image the default is `false`.
+
+For defence in depth run the container with `--read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges`; the image works with all of them.
 
 ## Configuration
 
@@ -155,7 +157,7 @@ pressroom renders HTML written by someone else, so the page is treated as untrus
 | `MAX_BODY_BYTES` | `2097152` | request body limit (1024 to 67108864) |
 | `RENDER_TIMEOUT` | `20s` | per-render time limit (1s to 2m) |
 | `CHROME_PATH` | auto-detect | Chrome, Chromium or chrome-headless-shell binary |
-| `CHROMIUM_NO_SANDBOX` | `false` | disable the Chromium sandbox (containers that cannot provide it) |
+| `CHROMIUM_NO_SANDBOX` | `false` (`true` in the image) | disable the Chromium sandbox; see the security model |
 | `RENDER_CONCURRENCY` | `2` | renders that run at once (1 to 16) |
 | `RENDER_QUEUE` | `4` | renders allowed to wait for a free slot (0 to 100); more get `429` |
 
@@ -163,7 +165,21 @@ Copy `.env.example` for a starting point and never commit a real token. Generate
 
 ## Run it
 
-Needs Go 1.22 or newer and a Chrome or Chromium binary. The steps are the same on macOS, Ubuntu and Fedora; only installing Go and the browser differs (Docker image coming, which bundles both).
+### With Docker
+
+The steps are the same on macOS, Ubuntu and Fedora; only installing Docker differs.
+
+```sh
+export PRESSROOM_TOKEN="$(openssl rand -hex 32)"
+make docker-build        # docker build -t pressroom:local .
+make docker-run          # serves on localhost:8080
+```
+
+The image is about 640 MB: the pinned `chromedp/headless-shell` base (Chromium 151), 60 MB of fonts (Noto Serif, Noto Sans, Noto Serif CJK SC) and the service binary. With a running browser the container used about 90 MB after twenty renders and peaked at 103 MiB.
+
+### Without Docker
+
+Needs Go 1.26 or newer and a Chrome or Chromium binary. Only installing Go and the browser differs between systems.
 
 ```sh
 export PRESSROOM_TOKEN="$(openssl rand -hex 32)"
@@ -173,7 +189,7 @@ curl -s localhost:8080/health
 curl -s localhost:8080/ready           # 200 once the browser answers
 ```
 
-The browser starts on the first render (or the first `/ready`), so the first request pays about half a second more. Han characters need a CJK font on the host; without one they print as empty boxes.
+The browser starts on the first render (or the first `/ready`), so the first request pays about half a second more. Han characters need a CJK font on the host (the image has one); without it they print as empty boxes. In your pages, use the font stack `"Noto Serif", "Noto Serif CJK SC", serif`.
 
 ## Development
 
@@ -192,6 +208,8 @@ internal/api         HTTP handlers and request validation
 internal/middleware  authentication, request log, panic recovery
 internal/render      the Renderer interface, the Chromium engine, a test double
 internal/limits      concurrency limit with a bounded queue
+Dockerfile           image: pinned headless-shell, pruned fonts, non-root
+docker/fonts.conf    maps serif and sans-serif to the bundled fonts
 docs/API.md          the contract
 docs/DESIGN.md       decisions and measurements
 ```
@@ -201,7 +219,7 @@ docs/DESIGN.md       decisions and measurements
 - [x] API, authentication, validation, errors, logs, CI
 - [x] Chromium engine with scripts disabled and all requests blocked, plus integration tests
 - [x] Concurrency limit with a bounded queue, graceful drain of in-flight renders, browser crash recovery
-- [ ] Docker image with fonts (Noto Serif, Noto Serif CJK, Noto Sans), non-root, sandbox on
+- [x] Docker image with fonts (Noto Serif, Noto Serif CJK, Noto Sans) and a non-root user; the sandbox cannot be on under Docker's default seccomp profile
 - [ ] Deployment notes for private networking, a sample client and a contract test
 - [ ] First tagged release
 
